@@ -1,0 +1,118 @@
+#!/bin/bash
+
+get_config() {
+    if [[ ! -z "$XDG_CONFIG_HOME" ]]; then
+        echo "$XDG_CONFIG_HOME/minirss.cfg"
+        return
+    fi
+    echo "$(realpath ~/.config/minirss.cfg)"
+    return
+}
+
+get_storage() {
+    if [[ ! -z "$XDG_DATA_HOME" ]]; then
+        echo "$XDG_DATA_HOME/minirss-store.txt"
+        return
+    fi
+    echo "$(realpath ~/.local/share/minirss-store.txt)"
+    return
+}
+
+usage() {
+    echo """Usage: $(basename $0) [-l LIST] [-d DELAY] [-s STORAGE]
+
+optional arguments:
+-h, --help              show this help message and exit
+-l, --list              list of rss feeds to check (default: $(get_config))
+-s, --storage           data storage file location (default: $(get_storage))
+-d, --delay DELAY       delay in seconds between checking feeds (default: 600)"""
+    exit 1
+}
+
+argparse() {
+    list=$(get_config)
+    storage=$(get_storage)
+    delay=600
+    verbose=false;
+
+    while [[ "$#" -gt 0 ]]; do
+        case $1 in
+            -h|--help) usage shift ;;
+            -l|--list) list="$2"; shift ;;
+            -s|--storage) storage="$2"; shift ;;
+            -d|--delay) delay="$2"; shift ;;
+            -v|--verbose) verbose=true; ;;
+            *) echo "Unknown parameter passed: $1"; exit 1 ;;
+        esac
+        shift
+    done
+
+    if [[ ! "$delay" -gt 0 ]] 2>&-; then
+        echo "Delay must be integer greater than 0"
+        exit 1
+    fi
+
+    # attempt create and check permissions for list/storage
+    ( [ -e "$list" ] || touch "$list" ) && [ ! -r "$list" ] && echo Cannot read $file && exit 1
+    ( [ -e "$storage" ] || touch "$storage" ) && [ ! -w "$storage" ] && echo Cannot write to $file && exit 1
+}
+
+log() {
+    if [[ "$verbose" == true ]]; then
+        echo $1
+    fi
+}
+
+argparse $@
+while true; do
+    while read line; do
+        if [[ "$line" != *"|"* ]]; then
+            log "No name provided, extracting from URL"
+            url="$(echo $line)"
+            name="$(echo $line | cut -d "/" -f3)" # hacky way to get name from domain
+        else
+            name="$(echo $line | cut -d "|" -f1)"
+            url="$(echo $line | cut -d "|" -f2)"
+        fi
+        feed="$(curl -s $url)"
+        items="$(echo $feed | xmlstarlet sel -T -t -m "rss/channel/item" -v "title" -o "|" -v "link" -n 2>&-)"
+        if [[ -z "$items" ]]; then
+            echo "Failed to process feed $name"
+            continue
+        fi
+
+        feedHash="$(echo $feed | md5sum | cut -d " " -f1)"
+        oldHash=$(grep "$name" "$storage" | cut -d "|" -f2)
+        firstRun=false
+        if [[ -z "$oldHash" ]]; then
+            echo "$name|$feedHash" >> "$storage"
+            firstRun=true
+            log "First run detected for $name"
+        fi
+        if [[ "$feedHash" == "$oldHash" ]]; then
+            log "$name not updated, continuing..."
+        else
+            log "$name updated, processing..."
+            while read item; do
+                itemHash=$(echo "$item" | md5sum | cut -d" " -f1)
+                if ! grep -q "$itemHash" "$storage"; then
+                    itemName=$(echo "$item" | cut -d "|" -f1)
+                    itemLink=$(echo "$item" | cut -d "|" -f2)
+                    log "New item for $name"
+                    notifyCommand="dunstify --action=open,Open"
+                    which dunst 1>&- 2>&- || notifyCommand="notify-send"
+                    if [[ "$firstRun" = false ]]; then
+                        action=$($notifyCommand "New post from $name" "$itemName")
+                        if [[ "$action" == "open" ]]; then
+                            xdg-open "$itemLink"
+                        fi
+                    fi
+                    echo "$itemHash" >> "$storage"
+                fi
+            done <<< "$items"
+            sed "s/$name|$oldHash/$name|$feedHash/" -i "$storage"
+        fi
+    done < "$list"
+    log "Finished processing feed, sleeping for $delay seconds"
+    sleep $delay
+done
