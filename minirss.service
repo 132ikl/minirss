@@ -1,0 +1,9 @@
+[Unit]
+Description=minirss minuscule RSS notifier
+
+[Service]
+ExecStart=/usr/bin/minirss
+Restart=always
+
+[Install]
+WantedBy=default.target

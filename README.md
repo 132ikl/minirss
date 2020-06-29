@@ -5,8 +5,19 @@ minirss is a tiny shell script to help you keep track of your RSS feeds. Wheneve
 Dependencies:
 * xmlstarlet
 * bash >= 4.0
-* dunst or notify-osd
+* `notify-send` OR `dunstify`
 * xdg-open
+
+## Installation
+
+On Arch Linux, minirss can be installed using its [AUR package](https://aur.archlinux.org/packages/minirss-git/).
+
+You can also manually install minirss through this process:
+```
+sudo cp minirss /usr/bin/minirss
+cp minirss ~/.config/systemd/user/
+systemctl --user enable --now minirss
+```
 
 ## Setup
 
@@ -15,4 +26,4 @@ minirss uses two files: a config file (default in $XDG_CONFIG_HOME) and a storag
 my cool display name|https://link-to-cool-rss-feed.com/feed.xml
 ```
 
-You can change the path of both of these files and the delay between checking feeds using the command line parameters (see `--help` for more info).
+You can change the path of both of these files and the delay between checking feeds using the command line parameters (see `--help` for more info). minirss will also always use the most updated config, no need to restart.
