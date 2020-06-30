@@ -99,8 +99,8 @@ while true; do
                     itemName=$(echo "$item" | cut -d "|" -f1)
                     itemLink=$(echo "$item" | cut -d "|" -f2)
                     log "New item for $name"
-                    notifyCommand="dunstify --action=open,Open"
-                    which dunst 1>&- 2>&- || notifyCommand="notify-send"
+                    notifyCommand="dunstify --action=open,Open --timeout=0"
+                    which dunst 1>&- 2>&- || notifyCommand="notify-send --expire-time=0"
                     if [[ "$firstRun" = false ]]; then
                         action=$($notifyCommand "New post from $name" "$itemName")
                         if [[ "$action" == "open" ]]; then
