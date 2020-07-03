@@ -74,8 +74,20 @@ while true; do
             name="$(echo $line | cut -d "|" -f1)"
             url="$(echo $line | cut -d "|" -f2)"
         fi
-        feed="$(curl -s $url)"
-        items="$(echo $feed | xmlstarlet sel -T -t -m "rss/channel/item" -v "title" -o "|" -v "link" -n 2>&-)"
+        feed="$(curl -s $url)" 
+        # i'm sure there's a better way to parse this...
+        if echo "$feed" | grep -q "<item>"; then
+            path="rss/channel/item"
+            link="link"
+        elif echo "$feed" | grep -q "<entry>"; then
+            path="feed/entry"
+            link="link/@href"
+            feed="$(echo $feed | perl -pe 's/ xmlns.*?=".+?"//g' | perl -pe 's/media://g')" # kinda yikes way of removing namespaces and media: tags
+        else
+            echo "Failed to find item name for feed $name"
+            continue
+        fi
+        items="$(echo $feed | xmlstarlet sel -T -t -m "$path" -v "title" -o "|" -v "$link" -n)"
         if [[ -z "$items" ]]; then
             echo "Failed to process feed $name"
             continue
@@ -98,7 +110,7 @@ while true; do
                 if ! grep -q "$itemHash" "$storage"; then
                     itemName=$(echo "$item" | cut -d "|" -f1)
                     itemLink=$(echo "$item" | cut -d "|" -f2)
-                    log "New item for $name"
+                    log "New item for $name: $itemName | $itemLink"
                     notifyCommand="dunstify --action=open,Open --timeout=0"
                     which dunst 1>&- 2>&- || notifyCommand="notify-send --expire-time=0"
                     if [[ "$firstRun" = false ]]; then
