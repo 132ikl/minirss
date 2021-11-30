@@ -1,134 +1,160 @@
-#!/bin/bash
+#!/usr/bin/env python3
 
-get_config() {
-    if [[ ! -z "$XDG_CONFIG_HOME" ]]; then
-        echo "$XDG_CONFIG_HOME/minirss.cfg"
-        return
-    fi
-    echo "$(realpath ~/.config/minirss.cfg)"
-    return
-}
+from argparse import ArgumentDefaultsHelpFormatter, ArgumentParser
+from dataclasses import dataclass
+from hashlib import md5
+from pathlib import Path
+from shutil import which
+from subprocess import run
+from threading import Thread
+from time import sleep
 
-get_storage() {
-    if [[ ! -z "$XDG_DATA_HOME" ]]; then
-        echo "$XDG_DATA_HOME/minirss-store.txt"
-        return
-    fi
-    echo "$(realpath ~/.local/share/minirss-store.txt)"
-    return
-}
+from appdirs import user_config_dir, user_data_dir
+from feedparser import parse
+from requests import get
 
-usage() {
-    echo """Usage: $(basename $0) [-l LIST] [-d DELAY] [-s STORAGE]
+parser = ArgumentParser(
+    formatter_class=ArgumentDefaultsHelpFormatter,
+)
+parser.add_argument(
+    "-l",
+    "--list",
+    help="path to list of feeds to check",
+    type=str,
+    default=user_config_dir() + "/minirss.cfg",
+)
+parser.add_argument(
+    "-s",
+    "--storage",
+    help="path to storage file location",
+    type=str,
+    default=user_data_dir() + "/minirss-store.txt",
+)
+parser.add_argument(
+    "-d",
+    "--delay",
+    help="delay in seconds between checking feeds",
+    type=int,
+    default=600,
+)
 
-optional arguments:
--h, --help              show this help message and exit
--l, --list              list of rss feeds to check (default: $(get_config))
--s, --storage           data storage file location (default: $(get_storage))
--d, --delay DELAY       delay in seconds between checking feeds (default: 600)"""
-    exit 1
-}
+# parse and validate args (check file perms)
+args = parser.parse_args()
+args.storage = Path(args.storage)
+args.list = Path(args.list)
+args.storage.touch()
+args.list.touch()
 
-argparse() {
-    list=$(get_config)
-    storage=$(get_storage)
-    delay=600
-    verbose=false;
+# decide notification backend
+if which("dunstify"):
+    BACKEND = "dunstify"
+elif which("notify-send"):
+    BACKEND = "notify-send"
+else:
+    raise RuntimeError("Please install either notify-send or dunstify.")
 
-    while [[ "$#" -gt 0 ]]; do
-        case $1 in
-            -h|--help) usage shift ;;
-            -l|--list) list="$2"; shift ;;
-            -s|--storage) storage="$2"; shift ;;
-            -d|--delay) delay="$2"; shift ;;
-            -v|--verbose) verbose=true; ;;
-            *) echo "Unknown parameter passed: $1"; exit 1 ;;
-        esac
-        shift
-    done
 
-    if [[ ! "$delay" -gt 0 ]] 2>&-; then
-        echo "Delay must be integer greater than 0"
-        exit 1
-    fi
+@dataclass
+class Feed:
+    name: str
+    url: str
+    options: str = None
 
-    # attempt create and check permissions for list/storage
-    ( [ -e "$list" ] || touch "$list" ) && [ ! -r "$list" ] && echo Cannot read $file && exit 1
-    ( [ -e "$storage" ] || touch "$storage" ) && [ ! -w "$storage" ] && echo Cannot write to $file && exit 1
-}
 
-log() {
-    if [[ "$verbose" == true ]]; then
-        echo $1
-    fi
-}
+@dataclass
+class Entry:
+    title: str
+    link: str
+    feed: Feed
 
-notification() {
-    notifyCommand="dunstify --action=open,Open --timeout=0"
-    which dunst 1>&- 2>&- || notifyCommand="notify-send --expire-time=0"
-    if [[ "$firstRun" = false ]]; then
-        action=$($notifyCommand "New post from $name" "$itemName")
-        if [[ "$action" == "open" ]]; then
-            xdg-open "$itemLink"
-        fi
-    fi
-}
+    def hash(self):
+        return md5(f"{self.title} {self.link}".encode("utf-8")).hexdigest()
 
-argparse $@
-while true; do
-    while read line; do
-        if [[ "$line" != *"|"* ]]; then
-            log "No name provided, extracting from URL"
-            url="$(echo $line)"
-            name="$(echo $line | cut -d "/" -f3)" # hacky way to get name from domain
-        else
-            name="$(echo $line | cut -d "|" -f1)"
-            url="$(echo $line | cut -d "|" -f2)"
-        fi
-        feed="$(curl -s $url)" 
-        # i'm sure there's a better way to parse this...
-        if echo "$feed" | grep -q "<item>"; then
-            path="rss/channel/item"
-            link="link"
-        elif echo "$feed" | grep -q "<entry>"; then
-            path="feed/entry"
-            link="link/@href"
-            feed="$(echo $feed | perl -pe 's/ xmlns.*?=".+?"//g' | perl -pe 's/media://g')" # kinda yikes way of removing namespaces and media: tags
-        else
-            echo "Failed to find item name for feed $name"
+    @classmethod
+    def from_raw(cls, raw, feed):
+        link = None
+        try:
+            link = raw.links[0]["href"]
+        except AttributeError:
+            print(f"Failed to find link for {feed.name}")
+        return cls(title=raw.title, link=link, feed=feed)
+
+
+def notify(entry):
+    cmd = [BACKEND, f"New post from {entry.feed.name}", entry.title]
+    if BACKEND == "dunstify" and entry.link:
+        cmd.append("--action=open,open")
+        cmd.append("--timeout=0")
+    process = run(cmd, capture_output=True, check=False)
+    if "open" in process.stdout.decode("utf-8"):
+        run(["xdg-open", entry.link], check=False)
+
+
+def check_hashes(entries):
+    # check which hashes are in storage
+    # remove any of which are (ie. we've already notified for entry)
+    with open(args.storage, "r") as file:
+        text = file.read()
+
+    output = []
+    for entry in entries:
+        if entry.hash() not in text:
+            output.append(entry)
+    return output
+
+
+def grab_one(raw_entries, feed):
+    try:
+        raw_entry = raw_entries[0]
+    except IndexError:
+        print(f"Failed to find entries in feed {feed.name}")
+    return Entry.from_raw(raw_entry, feed)
+
+
+def main():
+    with open(args.list, "r") as file:
+        lines = file.read().splitlines()
+
+    # Grab feeds
+    feeds = []
+    for line in lines:
+        if line.startswith("#"):
             continue
-        fi
-        items="$(echo $feed | xmlstarlet sel -T -t -m "$path" -v "title" -o "|" -v "$link" -n)"
-        if [[ -z "$items" ]]; then
-            echo "Failed to process feed $name"
-            continue
-        fi
+        feeds.append(Feed(*line.split("|")))
 
-        feedHash="$(echo $feed | md5sum | cut -d " " -f1)"
-        oldHash=$(grep "$name" "$storage" | cut -d "|" -f2)
-        firstRun=false
-        if [[ -z "$oldHash" ]]; then
-            echo "$name|$feedHash" >> "$storage"
-            firstRun=true
-            log "First run detected for $name"
-        fi
-        if [[ "$feedHash" == "$oldHash" ]]; then
-            log "$name not updated, continuing..."
-        else
-            log "$name updated, processing..."
-            while read item; do
-                itemHash=$(echo "$item" | md5sum | cut -d" " -f1)
-                if ! grep -q "$itemHash" "$storage"; then
-                    itemName=$(echo "$item" | cut -d "|" -f1)
-                    itemLink=$(echo "$item" | cut -d "|" -f2)
-                    log "New item for $name: $itemName | $itemLink"
-                    notification & disown # isolate blocking code
-                    echo "$itemHash" >> "$storage"
-                fi
-            done <<< "$items"
-            sed "s/$name|$oldHash/$name|$feedHash/" -i "$storage"
-        fi
-    done < "$list"
-    log "Finished processing feed, sleeping for $delay seconds"
-    sleep $delay
-done
+    # Grab feed content
+    entries = []
+    for feed in feeds:
+        raw = parse(get(feed.url).content).entries
+        if feed.options and "fullhistory" in feed.options:
+            entries += [Entry.from_raw(raw, feed) for raw in raw]
+        else:
+            entries.append(grab_one(raw, feed))
+
+    # find new entries
+    out = check_hashes(entries)
+
+    # return early and avoid write i/o if no new entries
+    if not out:
+        return
+
+    with open(args.storage, "r") as file:
+        lines = file.read().splitlines()
+
+    for entry in out:
+        if entry.feed.options and "fullhistory" not in entry.feed.options:
+            # remove old hash
+            lines = [line for line in lines if not line.starts_with(entry.feed.name)]
+        lines.append(f"{entry.feed.name}|{entry.hash()}")
+
+        # run in separate thread so we don't wait forever on dunst action
+        Thread(target=notify, args=(entry,), daemon=True).start()
+
+    # write modified lines to file
+    with open(args.storage, "w") as file:
+        file.write("\n".join(lines))
+
+
+while True:
+    main()
+    sleep(args.delay)
